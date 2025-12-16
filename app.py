@@ -11,7 +11,7 @@ from streamlit_gsheets import GSheetsConnection
 # --- CONFIGURATION ---
 # The CSV containing the recipes to evaluate (Read-Only)
 DATA_FILE = "Recipes evaluation - evaluation.csv"
-ANNOTATORS = ["Daniele", "Sebastiano", "Chef_Peach"]
+ANNOTATORS = ["Daniele", "Sebastiano", "Luca"]
 
 st.set_page_config(layout="wide", page_title="Recipe Eval (Google Sheets)")
 
