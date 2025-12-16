@@ -83,6 +83,8 @@ def load_source_data():
                 "title": row[0],
                 "A": mixed_out if mixed else ce,
                 "B": ce if mixed else mixed_out,
+                "A_is": "Mixed" if mixed else "CE",  # NEW: Track model for A
+                "B_is": "CE" if mixed else "Mixed",  # NEW: Track model for B
             }
         )
     return prepared_data
@@ -314,6 +316,8 @@ with st.form(key=f"form_{sample_id}"):
                 "B_errors": ";".join(be),
                 "notes": notes,
                 "timestamp": str(pd.Timestamp.now()),
+                "A_model": current_pair["A_is"],  # NEW: Save model name
+                "B_model": current_pair["B_is"],  # NEW: Save model name
             }
 
             with st.spinner("Saving to Google Sheets..."):
