@@ -1,0 +1,3 @@
+sample_id,recipe_title,pref_ingredients,pref_numbers,pref_procedure,pref_overall,A_cookable,A_trust_score,A_errors,A_has_safety_issue,B_cookable,B_trust_score,B_errors,B_has_safety_issue,notes,timestamp
+17,Pasta with Marinara Sauce,Tie (Parità),B,A,A,Sì,3,None,False,Sì,3,None,False,,2025-12-16 12:01:34.471644
+0,Spaghetti Carbonara,B,Tie,A,A,Yes,3,None,Yes,3,None,,2025-12-16 12:09:16.641631
