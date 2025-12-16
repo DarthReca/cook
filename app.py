@@ -1,88 +1,142 @@
 import json
 import os
+import time
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURATION ---
-RESULTS_FILE = "valutazioni_chefs_detailed.csv"
+# The CSV containing the recipes to evaluate (Read-Only)
 DATA_FILE = "Recipes evaluation - evaluation.csv"
+ANNOTATORS = ["Chef_Mario", "Chef_Luigi", "Chef_Peach"]
 
-st.set_page_config(layout="wide", page_title="Recipe Eval (ACL)")
+st.set_page_config(layout="wide", page_title="Recipe Eval (Google Sheets)")
+
+# ==========================================
+# 1. LOGIN SYSTEM
+# ==========================================
+if "annotator_name" not in st.session_state:
+    st.title("🔐 Annotator Login")
+    st.markdown("Please identify yourself to sync your personal progress.")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        selected_name = st.selectbox("Select your name:", ANNOTATORS, index=None)
+
+        if st.button("🚀 Start Evaluation", type="primary", use_container_width=True):
+            if selected_name:
+                st.session_state.annotator_name = selected_name
+                st.rerun()
+            else:
+                st.error("⚠️ You must select a name.")
+    st.stop()
+
+# Current User is set
+current_user = st.session_state.annotator_name
 
 
-# --- 1. DATA LOADING ---
+# ==========================================
+# 2. DATA LOADING & GOOGLE SHEETS
+# ==========================================
 @st.cache_data
-def load_and_prep_data():
+def load_source_data():
+    """Loads the source recipes from the local CSV."""
     if not os.path.exists(DATA_FILE):
         return []
 
     df = pl.read_csv(DATA_FILE)
-
     np.random.seed(42)
     is_mixed_A = np.random.rand(len(df)) < 0.5
 
-    # Persist mapping for reproducibility
+    # Persist mapping if needed
     if not os.path.exists("mapping_reference.csv"):
         mapping = [
-            {"id": i, "Mixed_is": "A" if b else "B", "CE_is": "B" if b else "A"}
-            for i, b in enumerate(is_mixed_A)
+            {"id": i, "Mixed_is": "A" if b else "B"} for i, b in enumerate(is_mixed_A)
         ]
         pl.DataFrame(mapping).write_csv("mapping_reference.csv")
 
     prepared_data = []
-    # Adjust column selection if your CSV headers differ
+    # Adjust column names as needed based on your file
     rows = df.select(
         "title", "output_Qwen3-4B-Cross-Entropy", "output_Qwen3-4B-Mixed"
     ).iter_rows()
 
     for i, (row, mixed) in enumerate(zip(rows, is_mixed_A)):
-        title = row[0]
-        raw_ce = row[1]
-        raw_mixed = row[2]
 
-        def parse_field(val):
+        def parse(val):
             try:
                 if isinstance(val, (dict, list)):
                     return val
                 return json.loads(val)
-            except (json.JSONDecodeError, TypeError):
-                return {"ingredients": ["Parse Error"], "instructions": [str(val)]}
+            except:
+                return {"ingredients": [], "instructions": [str(val)]}
 
-        ce = parse_field(raw_ce)
-        mixed_output = parse_field(raw_mixed)
+        ce = parse(row[1])
+        mixed_out = parse(row[2])
 
         prepared_data.append(
             {
                 "ID": i,
-                "title": title,
-                "A": mixed_output if mixed else ce,
-                "B": ce if mixed else mixed_output,
+                "title": row[0],
+                "A": mixed_out if mixed else ce,
+                "B": ce if mixed else mixed_out,
             }
         )
     return prepared_data
 
 
-data = load_and_prep_data()
+data = load_source_data()
+
+# Connect to Google Sheets
+conn = st.connection("gsheets", type=GSheetsConnection)
 
 
-# --- 2. HELPERS FOR PROGRESS ---
-def get_completed_ids():
-    """Reads the results file to find which IDs are already done."""
-    if os.path.exists(RESULTS_FILE):
-        try:
-            # Read CSV and get unique sample_ids
-            df_res = pd.read_csv(RESULTS_FILE)
-            if "sample_id" in df_res.columns:
-                return set(df_res["sample_id"].unique())
-        except Exception:
-            return set()
-    return set()
+def get_google_sheet_data():
+    """Reads the Google Sheet. Returns empty DF if sheet is empty."""
+    df = conn.read(ttl=0)
+    return df
+    try:
+        # ttl=0 means do not cache, always get fresh data
+        df = conn.read(ttl=0)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
-# Initialize session state for index
+def save_to_google_sheet(new_record):
+    """Reads current sheet, appends new row, writes back."""
+    df_existing = get_google_sheet_data()
+    df_new = pd.DataFrame([new_record])
+
+    # Concatenate
+    if not df_existing.empty:
+        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+
+    conn.update(data=df_combined)
+
+
+# ==========================================
+# 3. PROGRESS TRACKING (User Specific)
+# ==========================================
+# Load the sheet data to check progress
+df_results = get_google_sheet_data()
+
+# Filter: Which IDs has THIS SPECIFIC USER completed?
+completed_ids = set()
+if (
+    not df_results.empty
+    and "sample_id" in df_results.columns
+    and "annotator" in df_results.columns
+):
+    # We filter only rows where 'annotator' == current_user
+    user_rows = df_results[df_results["annotator"] == current_user]
+    completed_ids = set(user_rows["sample_id"].unique())
+
 if "current_idx" not in st.session_state:
     st.session_state.current_idx = 0
 
@@ -92,228 +146,192 @@ def go_next():
         st.session_state.current_idx += 1
 
 
-def go_prev():
-    if st.session_state.current_idx > 0:
-        st.session_state.current_idx -= 1
-
-
-# --- 3. SIDEBAR NAVIGATION ---
-completed_ids = get_completed_ids()
-total_samples = len(data)
-completed_count = len(completed_ids)
-
+# ==========================================
+# 4. SIDEBAR
+# ==========================================
 with st.sidebar:
-    st.header("📊 Progress")
-    st.progress(completed_count / total_samples if total_samples > 0 else 0)
-    st.write(f"**{completed_count} / {total_samples}** samples completed")
+    st.header(f"👤 {current_user}")
+    if st.button("Log out", key="logout"):
+        del st.session_state.annotator_name
+        st.rerun()
+
+    st.divider()
+
+    # Progress Bar
+    completed_count = len(completed_ids)
+    total = len(data)
+    st.progress(completed_count / total if total > 0 else 0)
+    st.write(f"**{completed_count}/{total}** completed")
 
     st.markdown("---")
-    st.subheader("Navigation")
 
-    # Create a list of options for the dropdown with visual cues
-    # Format: "ID: Title [✅]" or "ID: Title [ ]"
+    # Navigation Dropdown
+    # We mark with ✅ only if THIS user has done it
     options = [
         f"{d['ID']}: {d['title']} {'✅' if d['ID'] in completed_ids else ''}"
         for d in data
     ]
-
-    # Find the index in the options list that matches the current session state ID
-    current_option_index = st.session_state.current_idx
-
-    selected_option = st.selectbox(
-        "Jump to Sample:", options, index=current_option_index
+    selected_opt = st.selectbox(
+        "Navigate:", options, index=st.session_state.current_idx
     )
-
-    # Update state if user used the dropdown
-    selected_idx = int(selected_option.split(":")[0])
-    if selected_idx != st.session_state.current_idx:
-        st.session_state.current_idx = selected_idx
+    new_idx = int(selected_opt.split(":")[0])
+    if new_idx != st.session_state.current_idx:
+        st.session_state.current_idx = new_idx
         st.rerun()
 
-    # Button to find next pending
-    if st.button("⏭️ Find Next Pending"):
+    if st.button("⏭️ Find My Next Pending"):
         for i in range(len(data)):
             if data[i]["ID"] not in completed_ids:
                 st.session_state.current_idx = i
                 st.rerun()
-        st.success("All samples completed!")
+        st.success("You have completed all samples!")
 
-# --- 4. MAIN UI ---
-if not data:
-    st.error("No data found.")
-    st.stop()
-
+# ==========================================
+# 5. MAIN UI
+# ==========================================
 current_pair = data[st.session_state.current_idx]
 sample_id = current_pair["ID"]
 
-# Check status of THIS sample
-is_already_done = sample_id in completed_ids
+st.title("👨‍🍳 Recipe Evaluation (ACL)")
 
-st.title("👨‍🍳 Recipe Evaluation")
-
-# STATUS BANNER
-if is_already_done:
+# Status Banner
+if sample_id in completed_ids:
     st.warning(
-        f"⚠️ **Sample #{sample_id} is already evaluated.** Resubmitting will overwrite or duplicate the entry."
+        f"⚠️ You ({current_user}) have already evaluated Sample #{sample_id}. Submitting again will create a duplicate."
     )
-else:
-    st.info(f"📝 **Sample #{sample_id} - Pending Evaluation**")
 
-st.markdown(f"## 🍽️ Recipe Request: *{current_pair['title']}*")
-st.markdown("---")
+st.markdown(f"## 🍽️ *{current_pair['title']}*")
 
 
-# Render Recipe Function
-def render_recipe(recipe_data):
-    st.markdown("### 🥦 Ingredients")
-    ingredients = recipe_data.get("ingredients", [])
-    if isinstance(ingredients, list):
-        for ing in ingredients:
-            st.markdown(f"- {ing}")
+# --- Render Recipes ---
+def render(r):
+    st.markdown("#### Ingredients")
+    st.write(r.get("ingredients", []))
+    st.markdown("#### Instructions")
+    inst = r.get("instructions", [])
+    if isinstance(inst, list):
+        for i, s in enumerate(inst, 1):
+            st.markdown(f"**{i}.** {s}")
     else:
-        st.write(ingredients)
-
-    st.markdown("### 🍳 Instructions")
-    instructions = recipe_data.get("instructions", [])
-    if isinstance(instructions, list):
-        for i, step in enumerate(instructions, 1):
-            st.markdown(f"**{i}.** {step}")
-    else:
-        st.write(instructions)
+        st.write(inst)
 
 
-col1, col2 = st.columns(2)
-with col1:
-    st.header("Version A", divider="blue")
-    render_recipe(current_pair["A"])
-with col2:
-    st.header("Version B", divider="red")
-    render_recipe(current_pair["B"])
+c1, c2 = st.columns(2)
+with c1:
+    st.info("Versione A")
+    render(current_pair["A"])
+with c2:
+    st.success("Versione B")
+    render(current_pair["B"])
 
 st.divider()
 
-# --- 5. EVALUATION FORM ---
-# CRITICAL FIX: The key includes sample_id (f"key_{sample_id}").
-# When sample_id changes, Streamlit creates NEW widgets, resetting the values.
-
-with st.form(key=f"form_{sample_id}"):  # The form key also changes
-
-    st.markdown("#### 1. Comparison (A vs B)")
-    c1, c2 = st.columns(2)
-    with c1:
+# ==========================================
+# 6. FORM
+# ==========================================
+# KEY includes sample_id so form resets on navigation
+with st.form(key=f"form_{sample_id}"):
+    st.subheader("Comparison")
+    col_a, col_b = st.columns(2)
+    with col_a:
         p_ing = st.radio(
-            "**Ingredients:** More appropriate?",
+            "Ingredients Preference",
             ["A", "B", "Tie"],
             horizontal=True,
+            key=f"pi_{sample_id}",
             index=None,
-            key=f"p_ing_{sample_id}",
         )
         p_num = st.radio(
-            "**Numbers:** More plausible?",
+            "Numbers/Qty Preference",
             ["A", "B", "Tie"],
             horizontal=True,
+            key=f"pn_{sample_id}",
             index=None,
-            key=f"p_num_{sample_id}",
         )
-    with c2:
+    with col_b:
         p_proc = st.radio(
-            "**Procedure:** Easier to follow?",
+            "Procedure Preference",
             ["A", "B", "Tie"],
             horizontal=True,
+            key=f"pp_{sample_id}",
             index=None,
-            key=f"p_proc_{sample_id}",
         )
         p_all = st.radio(
-            "🏆 **OVERALL Preference:**",
+            "🏆 Overall Preference",
             ["A", "B", "Tie"],
             horizontal=True,
+            key=f"pall_{sample_id}",
             index=None,
-            key=f"p_all_{sample_id}",
         )
 
-    st.markdown("---")
-    st.markdown("#### 2. Expert Check (Individual)")
-
-    ce1, ce2 = st.columns(2)
-    error_opts = [
-        "Missing Core Ingredient",
-        "Hallucination/Bizarre",
-        "Bad Quantities",
-        "Bad Times",
-        "Bad Temperatures",
+    st.subheader("Expert Check")
+    ec1, ec2 = st.columns(2)
+    err_opts = [
+        "Missing Ingredient",
+        "Hallucination",
+        "Bad Qty",
+        "Bad Time",
+        "Bad Temperature",
         "Step Mismatch",
         "Safety Issue",
-        "Format Error",
     ]
 
-    with ce1:
-        st.markdown("**Version A Analysis**")
-        a_cook = st.selectbox(
-            "A: Cookable?",
-            ["Yes", "Maybe (needs fix)", "No"],
-            index=0,
-            key=f"a_cook_{sample_id}",
-        )
-        a_trust = st.slider("A: Trust Score (1-5)", 1, 5, 3, key=f"a_trust_{sample_id}")
-        a_err = st.multiselect("A: Severe Errors", error_opts, key=f"a_err_{sample_id}")
+    with ec1:
+        st.markdown("**Version A**")
+        ac = st.selectbox("Cookable?", ["Yes", "Maybe", "No"], key=f"ac_{sample_id}")
+        at = st.slider("Trust (1-5)", 1, 5, 3, key=f"at_{sample_id}")
+        ae = st.multiselect("Errors A", err_opts, key=f"ae_{sample_id}")
 
-    with ce2:
-        st.markdown("**Version B Analysis**")
-        b_cook = st.selectbox(
-            "B: Cookable?",
-            ["Yes", "Maybe (needs fix)", "No"],
-            index=0,
-            key=f"b_cook_{sample_id}",
-        )
-        b_trust = st.slider("B: Trust Score (1-5)", 1, 5, 3, key=f"b_trust_{sample_id}")
-        b_err = st.multiselect("B: Severe Errors", error_opts, key=f"b_err_{sample_id}")
+    with ec2:
+        st.markdown("**Version B**")
+        bc = st.selectbox("Cookable?", ["Yes", "Maybe", "No"], key=f"bc_{sample_id}")
+        bt = st.slider("Trust (1-5)", 1, 5, 3, key=f"bt_{sample_id}")
+        be = st.multiselect("Errors B", err_opts, key=f"be_{sample_id}")
 
-    st.markdown("---")
-    notes = st.text_area("Optional Notes", key=f"notes_{sample_id}")
+    notes = st.text_area("Notes", key=f"nt_{sample_id}")
 
-    # Save Button
-    submit = st.form_submit_button("💾 Save Evaluation", type="primary")
+    # SUBMIT
+    submitted = st.form_submit_button("☁️ Save to Google Drive", type="primary")
 
-    if submit:
-        # Validation
+    if submitted:
         if not all([p_ing, p_num, p_proc, p_all]):
-            st.error("⚠️ Please fill in all comparison fields in Section 1.")
+            st.error("Please fill all comparison fields.")
         else:
-            new_row = {
+            # Construct Record
+            record = {
+                "annotator": current_user,  # <--- VITAL for IAA
                 "sample_id": sample_id,
                 "recipe_title": current_pair["title"],
                 "pref_ingredients": p_ing,
                 "pref_numbers": p_num,
                 "pref_procedure": p_proc,
                 "pref_overall": p_all,
-                "A_cookable": a_cook,
-                "A_trust": a_trust,
-                "A_errors": ";".join(a_err) if a_err else "None",
-                "B_cookable": b_cook,
-                "B_trust": b_trust,
-                "B_errors": ";".join(b_err) if b_err else "None",
+                "A_cookable": ac,
+                "A_trust": at,
+                "A_errors": ";".join(ae),
+                "B_cookable": bc,
+                "B_trust": bt,
+                "B_errors": ";".join(be),
                 "notes": notes,
-                "timestamp": pd.Timestamp.now(),
+                "timestamp": str(pd.Timestamp.now()),
             }
 
-            # Save to CSV
-            df_entry = pd.DataFrame([new_row])
-            write_header = not os.path.exists(RESULTS_FILE)
-            df_entry.to_csv(RESULTS_FILE, mode="a", header=write_header, index=False)
+            with st.spinner("Saving to Google Sheets..."):
+                save_to_google_sheet(record)
 
             st.success("Saved! Moving to next...")
-
-            # Logic to move to next
+            time.sleep(1)  # Brief pause to show success message
             go_next()
             st.rerun()
 
-# Navigation Buttons at bottom
+# Navigation Footer
 c_prev, c_next = st.columns([1, 1])
 with c_prev:
-    if st.button("⬅️ Previous", use_container_width=True):
-        go_prev()
-        st.rerun()
+    if st.button("⬅️ Prev"):
+        if st.session_state.current_idx > 0:
+            st.session_state.current_idx -= 1
+            st.rerun()
 with c_next:
-    if st.button("Skip / Next ➡️", use_container_width=True):
+    if st.button("Next ➡️"):
         go_next()
         st.rerun()
